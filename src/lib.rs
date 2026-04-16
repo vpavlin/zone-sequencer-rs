@@ -170,18 +170,30 @@ fn zone_query_channel_inner(
         // Get current chain tip to start from recent blocks only
         // Scanning from genesis is too slow — start from (tip - lookback) instead
         let http_client = lb_common_http_client::CommonHttpClient::new(None);
-        let start_cursor = if let Ok(info) = http_client.consensus_info(url.clone()).await {
-            let tip_slot: u64 = info.slot.into();
-            let lookback: u64 = 50000; // scan last 50k slots (~14 hours at 1s slots)
-            let start_slot = tip_slot.saturating_sub(lookback);
-            serde_json::from_str::<logos_blockchain_zone_sdk::indexer::Cursor>(
-                    &format!(r#"{{"slot":{},"last_id":null}}"#, start_slot)
-                ).ok()
-        } else {
-            None // fall back to genesis if we can't get tip
+        let start_cursor = match http_client.consensus_info(url.clone()).await {
+            Ok(info) => {
+                let tip_slot: u64 = info.slot.into();
+                let lookback: u64 = 50000; // scan last 50k slots (~14 hours at 1s slots)
+                let start_slot = tip_slot.saturating_sub(lookback);
+                eprintln!("zone_query_channel: tip_slot={} start_slot={}", tip_slot, start_slot);
+                serde_json::from_str::<logos_blockchain_zone_sdk::indexer::Cursor>(
+                        &format!(r#"{{"slot":{},"last_id":null}}"#, start_slot)
+                    ).ok()
+            }
+            Err(e) => {
+                eprintln!("zone_query_channel: consensus_info error: {:?} — scanning from genesis", e);
+                None // fall back to genesis if we can't get tip
+            }
         };
 
-        let poll = indexer.next_messages(start_cursor, limit as usize).await.ok()?;
+        let poll = match indexer.next_messages(start_cursor, limit as usize).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("zone_query_channel: next_messages error: {:?}", e);
+                return None;
+            }
+        };
+        eprintln!("zone_query_channel: got {} messages", poll.messages.len());
         let items: Vec<serde_json::Value> = poll.messages.iter().map(|b| {
             serde_json::json!({
                 "id": hex::encode(<[u8; 32]>::from(b.id)),
