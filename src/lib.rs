@@ -38,7 +38,8 @@ fn save_checkpoint(path: &str, checkpoint: &SequencerCheckpoint) {
 /// Publish data to a zone channel.
 ///
 /// - node_url: HTTP endpoint e.g. "http://192.168.0.209:8080"
-/// - signing_key_hex: 64-char hex (32-byte Ed25519 seed). Channel ID derived from public key.
+/// - channel_id_hex: 64-char hex channel ID (32 bytes) to publish to
+/// - signing_key_hex: 64-char hex (32-byte Ed25519 seed).
 /// - data: text to inscribe
 /// - checkpoint_path: file to load/save checkpoint ("" to disable). On first publish for a
 ///   fresh channel, pass a path but it's fine if the file doesn't exist yet.
@@ -47,11 +48,12 @@ fn save_checkpoint(path: &str, checkpoint: &SequencerCheckpoint) {
 #[no_mangle]
 pub extern "C" fn zone_publish(
     node_url: *const c_char,
+    channel_id_hex: *const c_char,
     signing_key_hex: *const c_char,
     data: *const c_char,
     checkpoint_path: *const c_char,
 ) -> *mut c_char {
-    let result = std::panic::catch_unwind(|| zone_publish_inner(node_url, signing_key_hex, data, checkpoint_path));
+    let result = std::panic::catch_unwind(|| zone_publish_inner(node_url, channel_id_hex, signing_key_hex, data, checkpoint_path));
     match result {
         Ok(Some(s)) => s.into_raw(),
         Ok(None) => { eprintln!("zone_publish: returned None"); std::ptr::null_mut() }
@@ -61,16 +63,18 @@ pub extern "C" fn zone_publish(
 
 fn zone_publish_inner(
     node_url: *const c_char,
+    channel_id_hex: *const c_char,
     signing_key_hex: *const c_char,
     data: *const c_char,
     checkpoint_path: *const c_char,
 ) -> Option<CString> {
-    if node_url.is_null() || signing_key_hex.is_null() || data.is_null() {
+    if node_url.is_null() || channel_id_hex.is_null() || signing_key_hex.is_null() || data.is_null() {
         eprintln!("zone_publish: null argument");
         return None;
     }
 
     let node_url_str = unsafe { CStr::from_ptr(node_url) }.to_str().ok()?;
+    let channel_id_hex_str = unsafe { CStr::from_ptr(channel_id_hex) }.to_str().ok()?;
     let signing_key_str = unsafe { CStr::from_ptr(signing_key_hex) }.to_str().ok()?;
     let data_str = unsafe { CStr::from_ptr(data) }.to_str().ok()?;
     let ckpt_path = if checkpoint_path.is_null() { "" } else {
@@ -79,13 +83,13 @@ fn zone_publish_inner(
 
     let key_bytes: [u8; 32] = hex::decode(signing_key_str).ok()?.try_into().ok()?;
     let signing_key = Ed25519Key::from_bytes(&key_bytes);
-    let channel_bytes: [u8; 32] = signing_key.public_key().to_bytes();
+    let channel_bytes: [u8; 32] = hex::decode(channel_id_hex_str).ok()?.try_into().ok()?;
     let channel_id = ChannelId::from(channel_bytes);
     let url: Url = node_url_str.parse().ok()?;
 
     let checkpoint = load_checkpoint(ckpt_path);
     eprintln!("zone_publish: node={} channel={} checkpoint={}",
-        url, hex::encode(channel_bytes),
+        url, channel_id_hex_str,
         if checkpoint.is_some() { "loaded" } else { "fresh" });
 
     let data_bytes = data_str.as_bytes().to_vec();
