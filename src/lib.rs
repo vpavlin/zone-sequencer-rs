@@ -194,7 +194,34 @@ fn zone_query_channel_inner(
     CString::new(result).ok()
 }
 
-/// Free a string returned by zone_publish or zone_query_channel.
+/// Derive the 64-char hex channel ID from an Ed25519 signing key without publishing.
+///
+/// - signing_key_hex: 64-char hex (32-byte Ed25519 seed)
+///
+/// Returns heap-allocated 64-char hex channel ID, or NULL on error. Free with zone_free_string().
+#[no_mangle]
+pub extern "C" fn zone_derive_channel_id(signing_key_hex: *const c_char) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| zone_derive_channel_id_inner(signing_key_hex));
+    match result {
+        Ok(Some(s)) => s.into_raw(),
+        Ok(None) => { eprintln!("zone_derive_channel_id: returned None"); std::ptr::null_mut() }
+        Err(e) => { eprintln!("zone_derive_channel_id: panicked: {:?}", e); std::ptr::null_mut() }
+    }
+}
+
+fn zone_derive_channel_id_inner(signing_key_hex: *const c_char) -> Option<CString> {
+    if signing_key_hex.is_null() {
+        eprintln!("zone_derive_channel_id: null argument");
+        return None;
+    }
+    let signing_key_str = unsafe { CStr::from_ptr(signing_key_hex) }.to_str().ok()?;
+    let key_bytes: [u8; 32] = hex::decode(signing_key_str).ok()?.try_into().ok()?;
+    let signing_key = Ed25519Key::from_bytes(&key_bytes);
+    let channel_bytes: [u8; 32] = signing_key.public_key().to_bytes();
+    CString::new(hex::encode(channel_bytes)).ok()
+}
+
+/// Free a string returned by zone_publish, zone_query_channel, or zone_derive_channel_id.
 #[no_mangle]
 pub extern "C" fn zone_free_string(s: *mut c_char) {
     if !s.is_null() {
