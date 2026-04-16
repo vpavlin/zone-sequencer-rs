@@ -12,6 +12,19 @@ use reqwest::Url;
 use tokio::runtime::Runtime;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+static TRACING_INIT: OnceLock<()> = OnceLock::new();
+
+fn init_tracing() {
+    TRACING_INIT.get_or_init(|| {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"))
+            )
+            .with_writer(std::io::stderr)
+            .init();
+    });
+}
 
 fn get_runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
@@ -25,7 +38,16 @@ fn get_runtime() -> &'static Runtime {
 fn load_checkpoint(path: &str) -> Option<SequencerCheckpoint> {
     if path.is_empty() { return None; }
     let data = fs::read(path).ok()?;
-    serde_json::from_slice(&data).ok()
+    let mut cp: SequencerCheckpoint = serde_json::from_slice(&data).ok()?;
+    // Always clear pending_txs on load: they may be stale (from a session that ended
+    // before LIB confirmation), and restoring them causes the sequencer to wait for
+    // transactions that the node may have already dropped.  The last_msg_id is kept
+    // so the chain stays contiguous.
+    if !cp.pending_txs.is_empty() {
+        eprintln!("load_checkpoint: cleared {} stale pending_txs", cp.pending_txs.len());
+        cp.pending_txs.clear();
+    }
+    Some(cp)
 }
 
 fn save_checkpoint(path: &str, checkpoint: &SequencerCheckpoint) {
@@ -53,6 +75,7 @@ pub extern "C" fn zone_publish(
     data: *const c_char,
     checkpoint_path: *const c_char,
 ) -> *mut c_char {
+    init_tracing();
     let result = std::panic::catch_unwind(|| zone_publish_inner(node_url, channel_id_hex, signing_key_hex, data, checkpoint_path));
     match result {
         Ok(Some(s)) => s.into_raw(),
@@ -155,6 +178,7 @@ pub extern "C" fn zone_query_channel(
     channel_id_hex: *const c_char,
     limit: i32,
 ) -> *mut c_char {
+    init_tracing();
     let result = std::panic::catch_unwind(|| zone_query_channel_inner(node_url, channel_id_hex, limit));
     match result {
         Ok(Some(s)) => s.into_raw(),
@@ -231,6 +255,7 @@ fn zone_query_channel_inner(
 /// Returns heap-allocated 64-char hex channel ID, or NULL on error. Free with zone_free_string().
 #[no_mangle]
 pub extern "C" fn zone_derive_channel_id(signing_key_hex: *const c_char) -> *mut c_char {
+    init_tracing();
     let result = std::panic::catch_unwind(|| zone_derive_channel_id_inner(signing_key_hex));
     match result {
         Ok(Some(s)) => s.into_raw(),
@@ -273,6 +298,7 @@ pub extern "C" fn zone_query_channel_paged(
     cursor_json: *const c_char,
     limit: i32,
 ) -> *mut c_char {
+    init_tracing();
     let result = std::panic::catch_unwind(|| {
         zone_query_channel_paged_inner(node_url, channel_id_hex, cursor_json, limit)
     });

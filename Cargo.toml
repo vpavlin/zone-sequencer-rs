@@ -15,3 +15,4 @@ hex = "0.4"
 serde_json = "1"
 lb-common-http-client = { git = "https://github.com/logos-blockchain/logos-blockchain", rev = "6b42706177dbbbde00db30d4ceca76e252cc1026", package = "logos-blockchain-common-http-client" }
 reqwest = { version = "0.12", features = ["json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

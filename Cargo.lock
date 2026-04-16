@@ -4657,4 +4657,5 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tokio",
+ "tracing-subscriber 0.3.23",
 ]
