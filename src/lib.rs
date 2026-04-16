@@ -104,8 +104,22 @@ fn zone_publish_inner(
                     let id_bytes: [u8; 32] = result.inscription_id.into();
                     let id_hex = hex::encode(id_bytes);
                     eprintln!("zone_publish: inscription_id={}", id_hex);
-                    save_checkpoint(ckpt_path, &result.checkpoint);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    // Save checkpoint with pending_txs cleared.
+                    // The sequencer saves the fresh publish as a pending_tx (not yet in LIB),
+                    // but if we persist that and the session ends before LIB confirmation
+                    // (~10 min), the next session blocks forever waiting for it to resolve.
+                    // Clearing pending_txs lets the next init start without that deadlock;
+                    // the sequencer will re-discover the chain head from last_msg_id instead.
+                    if !ckpt_path.is_empty() {
+                        if let Ok(data) = serde_json::to_vec(&result.checkpoint) {
+                            if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&data) {
+                                val["pending_txs"] = serde_json::json!([]);
+                                if let Ok(cleaned) = serde_json::to_vec(&val) {
+                                    let _ = fs::write(ckpt_path, cleaned);
+                                }
+                            }
+                        }
+                    }
                     return Some(id_hex);
                 }
                 Err(e) => {
