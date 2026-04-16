@@ -35,14 +35,32 @@ fn get_runtime() -> &'static Runtime {
     })
 }
 
-fn load_checkpoint(path: &str) -> Option<SequencerCheckpoint> {
+fn sidecar_path(checkpoint_path: &str) -> String {
+    format!("{}.channel", checkpoint_path)
+}
+
+fn load_checkpoint(path: &str, channel_id_hex: &str) -> Option<SequencerCheckpoint> {
     if path.is_empty() { return None; }
+    if !std::path::Path::new(path).exists() { return None; }
+
+    let sidecar = sidecar_path(path);
+    if std::path::Path::new(&sidecar).exists() {
+        let saved = fs::read(&sidecar).unwrap_or_default();
+        let saved_hex = hex::encode(&saved);
+        if saved_hex != channel_id_hex {
+            eprintln!("load_checkpoint: channel ID changed — discarding stale checkpoint");
+            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(&sidecar);
+            return None;
+        }
+    } else {
+        eprintln!("load_checkpoint: no channel sidecar — discarding stale checkpoint");
+        let _ = fs::remove_file(path);
+        return None;
+    }
+
     let data = fs::read(path).ok()?;
     let mut cp: SequencerCheckpoint = serde_json::from_slice(&data).ok()?;
-    // Always clear pending_txs on load: they may be stale (from a session that ended
-    // before LIB confirmation), and restoring them causes the sequencer to wait for
-    // transactions that the node may have already dropped.  The last_msg_id is kept
-    // so the chain stays contiguous.
     if !cp.pending_txs.is_empty() {
         eprintln!("load_checkpoint: cleared {} stale pending_txs", cp.pending_txs.len());
         cp.pending_txs.clear();
@@ -50,10 +68,13 @@ fn load_checkpoint(path: &str) -> Option<SequencerCheckpoint> {
     Some(cp)
 }
 
-fn save_checkpoint(path: &str, checkpoint: &SequencerCheckpoint) {
+fn save_checkpoint(path: &str, checkpoint: &SequencerCheckpoint, channel_id_hex: &str) {
     if path.is_empty() { return; }
     if let Ok(data) = serde_json::to_vec(checkpoint) {
         let _ = fs::write(path, data);
+    }
+    if let Ok(channel_bytes) = hex::decode(channel_id_hex) {
+        let _ = fs::write(sidecar_path(path), channel_bytes);
     }
 }
 
@@ -110,7 +131,7 @@ fn zone_publish_inner(
     let channel_id = ChannelId::from(channel_bytes);
     let url: Url = node_url_str.parse().ok()?;
 
-    let checkpoint = load_checkpoint(ckpt_path);
+    let checkpoint = load_checkpoint(ckpt_path, channel_id_hex_str);
     eprintln!("zone_publish: node={} channel={} checkpoint={}",
         url, channel_id_hex_str,
         if checkpoint.is_some() { "loaded" } else { "fresh" });
@@ -131,22 +152,10 @@ fn zone_publish_inner(
                     let id_bytes: [u8; 32] = result.inscription_id.into();
                     let id_hex = hex::encode(id_bytes);
                     eprintln!("zone_publish: inscription_id={}", id_hex);
-                    // Save checkpoint with pending_txs cleared.
-                    // The sequencer saves the fresh publish as a pending_tx (not yet in LIB),
-                    // but if we persist that and the session ends before LIB confirmation
-                    // (~10 min), the next session blocks forever waiting for it to resolve.
-                    // Clearing pending_txs lets the next init start without that deadlock;
-                    // the sequencer will re-discover the chain head from last_msg_id instead.
-                    if !ckpt_path.is_empty() {
-                        if let Ok(data) = serde_json::to_vec(&result.checkpoint) {
-                            if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&data) {
-                                val["pending_txs"] = serde_json::json!([]);
-                                if let Ok(cleaned) = serde_json::to_vec(&val) {
-                                    let _ = fs::write(ckpt_path, cleaned);
-                                }
-                            }
-                        }
-                    }
+                    // Save checkpoint with pending_txs cleared + channel sidecar.
+                    let mut clean_cp = result.checkpoint.clone();
+                    clean_cp.pending_txs.clear();
+                    save_checkpoint(ckpt_path, &clean_cp, channel_id_hex_str);
                     return Some(id_hex);
                 }
                 Err(e) => {
@@ -403,8 +412,174 @@ fn zone_query_channel_paged_inner(
     CString::new(result).ok()
 }
 
+// ── Persistent sequencer handle ──────────────────────────────────────────────
+
+struct SequencerHandle {
+    sequencer: ZoneSequencer,
+    channel_id_hex: String,
+    checkpoint_path: String,
+}
+
+/// Create a persistent sequencer handle.  The background actor connects to the
+/// node and stays alive until `zone_sequencer_destroy` is called.
+///
+/// Returns an opaque handle (caller must NOT free directly), or NULL on error.
+#[no_mangle]
+pub extern "C" fn zone_sequencer_create(
+    node_url: *const c_char,
+    channel_id_hex: *const c_char,
+    signing_key_hex: *const c_char,
+    checkpoint_path: *const c_char,
+) -> *mut std::ffi::c_void {
+    init_tracing();
+    let result = std::panic::catch_unwind(|| {
+        zone_sequencer_create_inner(node_url, channel_id_hex, signing_key_hex, checkpoint_path)
+    });
+    match result {
+        Ok(Some(ptr)) => ptr,
+        Ok(None) => { eprintln!("zone_sequencer_create: returned None"); std::ptr::null_mut() }
+        Err(e) => { eprintln!("zone_sequencer_create: panicked: {:?}", e); std::ptr::null_mut() }
+    }
+}
+
+fn zone_sequencer_create_inner(
+    node_url: *const c_char,
+    channel_id_hex: *const c_char,
+    signing_key_hex: *const c_char,
+    checkpoint_path: *const c_char,
+) -> Option<*mut std::ffi::c_void> {
+    if node_url.is_null() || channel_id_hex.is_null() || signing_key_hex.is_null() {
+        eprintln!("zone_sequencer_create: null argument");
+        return None;
+    }
+
+    let node_url_str = unsafe { CStr::from_ptr(node_url) }.to_str().ok()?;
+    let channel_id_hex_str = unsafe { CStr::from_ptr(channel_id_hex) }.to_str().ok()?;
+    let signing_key_str = unsafe { CStr::from_ptr(signing_key_hex) }.to_str().ok()?;
+    let ckpt_path = if checkpoint_path.is_null() { "" } else {
+        unsafe { CStr::from_ptr(checkpoint_path) }.to_str().unwrap_or("")
+    };
+
+    let key_bytes: [u8; 32] = hex::decode(signing_key_str).ok()?.try_into().ok()?;
+    let signing_key = Ed25519Key::from_bytes(&key_bytes);
+    let channel_bytes: [u8; 32] = hex::decode(channel_id_hex_str).ok()?.try_into().ok()?;
+    let channel_id = ChannelId::from(channel_bytes);
+    let url: Url = node_url_str.parse().ok()?;
+
+    let checkpoint = load_checkpoint(ckpt_path, channel_id_hex_str);
+    eprintln!("zone_sequencer_create: node={} channel={} checkpoint={}",
+        url, channel_id_hex_str,
+        if checkpoint.is_some() { "loaded" } else { "fresh" });
+
+    let rt = get_runtime();
+    let sequencer = rt.block_on(async {
+        ZoneSequencer::init(channel_id, signing_key, url, None, checkpoint)
+    });
+
+    let handle = Box::new(SequencerHandle {
+        sequencer,
+        channel_id_hex: channel_id_hex_str.to_string(),
+        checkpoint_path: ckpt_path.to_string(),
+    });
+
+    Some(Box::into_raw(handle) as *mut std::ffi::c_void)
+}
+
+/// Publish data using an existing sequencer handle.
+/// Returns heap-allocated hex inscription ID, or NULL on error.
+/// Caller must free the returned string with `zone_free_string`.
+#[no_mangle]
+pub extern "C" fn zone_sequencer_publish(
+    handle: *mut std::ffi::c_void,
+    data: *const c_char,
+) -> *mut c_char {
+    init_tracing();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        zone_sequencer_publish_inner(handle, data)
+    }));
+    match result {
+        Ok(Some(s)) => s.into_raw(),
+        Ok(None) => { eprintln!("zone_sequencer_publish: returned None"); std::ptr::null_mut() }
+        Err(e) => { eprintln!("zone_sequencer_publish: panicked: {:?}", e); std::ptr::null_mut() }
+    }
+}
+
+fn zone_sequencer_publish_inner(
+    handle: *mut std::ffi::c_void,
+    data: *const c_char,
+) -> Option<CString> {
+    if handle.is_null() || data.is_null() {
+        eprintln!("zone_sequencer_publish: null argument");
+        return None;
+    }
+
+    let h = unsafe { &*(handle as *const SequencerHandle) };
+    let data_str = unsafe { CStr::from_ptr(data) }.to_str().ok()?;
+    let data_bytes = data_str.as_bytes().to_vec();
+
+    eprintln!("zone_sequencer_publish: publishing {} bytes...", data_bytes.len());
+
+    let rt = get_runtime();
+    let result = rt.block_on(async {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match h.sequencer.publish(data_bytes.clone()).await {
+                Ok(result) => {
+                    let id_bytes: [u8; 32] = result.inscription_id.into();
+                    let id_hex = hex::encode(id_bytes);
+                    eprintln!("zone_sequencer_publish: inscription_id={}", id_hex);
+                    let mut clean_cp = result.checkpoint.clone();
+                    clean_cp.pending_txs.clear();
+                    save_checkpoint(&h.checkpoint_path, &clean_cp, &h.channel_id_hex);
+                    return Some(id_hex);
+                }
+                Err(e) => {
+                    if attempts > 5 {
+                        eprintln!("zone_sequencer_publish: failed after {} attempts: {}", attempts, e);
+                        return None;
+                    }
+                    eprintln!("zone_sequencer_publish: attempt {}: {} — retrying in 1s...", attempts, e);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    })?;
+
+    CString::new(result).ok()
+}
+
+/// Get the current checkpoint as JSON.
+/// Caller must free the returned string with `zone_free_string`.
+#[no_mangle]
+pub extern "C" fn zone_sequencer_checkpoint(handle: *mut std::ffi::c_void) -> *mut c_char {
+    init_tracing();
+    if handle.is_null() { return std::ptr::null_mut(); }
+    let h = unsafe { &*(handle as *const SequencerHandle) };
+    let rt = get_runtime();
+    let result = rt.block_on(async {
+        match h.sequencer.checkpoint().await {
+            Ok(cp) => serde_json::to_string(&cp).ok(),
+            Err(e) => { eprintln!("zone_sequencer_checkpoint: {}", e); None }
+        }
+    });
+    match result {
+        Some(json) => CString::new(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Destroy a sequencer handle created by `zone_sequencer_create`.
+/// The background actor is stopped when the handle is dropped.
+#[no_mangle]
+pub extern "C" fn zone_sequencer_destroy(handle: *mut std::ffi::c_void) {
+    if handle.is_null() { return; }
+    unsafe { drop(Box::from_raw(handle as *mut SequencerHandle)); }
+    eprintln!("zone_sequencer_destroy: handle dropped");
+}
+
 /// Free a string returned by zone_publish, zone_query_channel, zone_derive_channel_id,
-/// or zone_query_channel_paged.
+/// zone_query_channel_paged, zone_sequencer_publish, or zone_sequencer_checkpoint.
 #[no_mangle]
 pub extern "C" fn zone_free_string(s: *mut c_char) {
     if !s.is_null() {
