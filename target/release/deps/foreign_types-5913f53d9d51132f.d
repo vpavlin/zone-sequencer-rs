@@ -1,7 +1,0 @@
-/home/jimmy/zone-sequencer-rs/target/release/deps/foreign_types-5913f53d9d51132f.d: /home/jimmy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foreign-types-0.3.2/src/lib.rs
-
-/home/jimmy/zone-sequencer-rs/target/release/deps/libforeign_types-5913f53d9d51132f.rlib: /home/jimmy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foreign-types-0.3.2/src/lib.rs
-
-/home/jimmy/zone-sequencer-rs/target/release/deps/libforeign_types-5913f53d9d51132f.rmeta: /home/jimmy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foreign-types-0.3.2/src/lib.rs
-
-/home/jimmy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foreign-types-0.3.2/src/lib.rs:

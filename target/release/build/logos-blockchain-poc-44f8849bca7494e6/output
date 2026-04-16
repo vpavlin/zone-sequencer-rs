@@ -1,2 +1,0 @@
-cargo:rustc-env=CARGO_BUILD_VERIFICATION_KEY=/home/jimmy/.logos-blockchain-circuits/poc/verification_key.json
-cargo:rerun-if-changed=/home/jimmy/.logos-blockchain-circuits/poc/verification_key.json
