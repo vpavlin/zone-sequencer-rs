@@ -233,7 +233,134 @@ fn zone_derive_channel_id_inner(signing_key_hex: *const c_char) -> Option<CStrin
     CString::new(hex::encode(channel_bytes)).ok()
 }
 
-/// Free a string returned by zone_publish, zone_query_channel, or zone_derive_channel_id.
+/// Query a zone channel with cursor-based pagination for full history backfill.
+///
+/// - node_url: HTTP endpoint e.g. "http://192.168.0.209:8080"
+/// - channel_id_hex: 64-char hex channel ID (32 bytes)
+/// - cursor_json: JSON cursor from previous call, or NULL to start from genesis
+/// - limit: max number of inscriptions to return per page
+///
+/// Returns JSON object:
+/// {"messages":[{"id":"hex","data":"text"},...],
+///  "cursor":{"slot":N,"last_id":null},
+///  "cursor_slot":N,
+///  "lib_slot":N,
+///  "done":bool}
+/// or NULL on error. Caller must free with zone_free_string().
+/// "done" is true when cursor_slot >= lib_slot (reached LIB — all finalized history scanned).
+#[no_mangle]
+pub extern "C" fn zone_query_channel_paged(
+    node_url: *const c_char,
+    channel_id_hex: *const c_char,
+    cursor_json: *const c_char,
+    limit: i32,
+) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        zone_query_channel_paged_inner(node_url, channel_id_hex, cursor_json, limit)
+    });
+    match result {
+        Ok(Some(s)) => s.into_raw(),
+        Ok(None) => { eprintln!("zone_query_channel_paged: returned None"); std::ptr::null_mut() }
+        Err(e) => { eprintln!("zone_query_channel_paged: panicked: {:?}", e); std::ptr::null_mut() }
+    }
+}
+
+fn zone_query_channel_paged_inner(
+    node_url: *const c_char,
+    channel_id_hex: *const c_char,
+    cursor_json: *const c_char,
+    limit: i32,
+) -> Option<CString> {
+    if node_url.is_null() || channel_id_hex.is_null() {
+        eprintln!("zone_query_channel_paged: null argument");
+        return None;
+    }
+
+    let node_url_str = unsafe { CStr::from_ptr(node_url) }.to_str().ok()?;
+    let channel_id_hex_str = unsafe { CStr::from_ptr(channel_id_hex) }.to_str().ok()?;
+
+    let channel_id = ChannelId::from(
+        <[u8; 32]>::try_from(hex::decode(channel_id_hex_str).ok()?).ok()?
+    );
+    let url: Url = node_url_str.parse().ok()?;
+
+    // Parse optional incoming cursor (NULL or empty = from genesis)
+    let start_cursor: Option<logos_blockchain_zone_sdk::indexer::Cursor> = if cursor_json.is_null() {
+        None
+    } else {
+        let cstr = unsafe { CStr::from_ptr(cursor_json) }.to_str().unwrap_or("");
+        if cstr.is_empty() || cstr == "null" {
+            None
+        } else {
+            serde_json::from_str(cstr).ok()
+        }
+    };
+
+    let cursor_slot_hint = start_cursor.as_ref().map(|c| {
+        // Extract slot from cursor JSON for progress reporting
+        serde_json::to_value(c).ok()
+            .and_then(|v| v["slot"].as_u64())
+            .unwrap_or(0)
+    }).unwrap_or(0);
+
+    eprintln!("zone_query_channel_paged: channel={} cursor_slot={} limit={}",
+        channel_id_hex_str, cursor_slot_hint, limit);
+
+    let indexer = ZoneIndexer::new(channel_id, url.clone(), None);
+    let rt = get_runtime();
+
+    let result = rt.block_on(async {
+        // Get LIB slot for progress / done detection
+        let http_client = lb_common_http_client::CommonHttpClient::new(None);
+        let lib_slot: u64 = match http_client.consensus_info(url.clone()).await {
+            Ok(info) => {
+                // consensus_info returns tip; LIB is typically ~600 slots behind
+                let tip: u64 = info.slot.into();
+                tip.saturating_sub(600)
+            }
+            Err(e) => {
+                eprintln!("zone_query_channel_paged: consensus_info error: {:?}", e);
+                0
+            }
+        };
+
+        let poll = match indexer.next_messages(start_cursor, limit as usize).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("zone_query_channel_paged: next_messages error: {:?}", e);
+                return None;
+            }
+        };
+
+        let items: Vec<serde_json::Value> = poll.messages.iter().map(|b| {
+            serde_json::json!({
+                "id": hex::encode(<[u8; 32]>::from(b.id)),
+                "data": String::from_utf8_lossy(&b.data).to_string()
+            })
+        }).collect();
+
+        let cursor_val = serde_json::to_value(&poll.cursor).unwrap_or(serde_json::Value::Null);
+        let new_cursor_slot = cursor_val["slot"].as_u64().unwrap_or(0);
+        let done = lib_slot > 0 && new_cursor_slot >= lib_slot;
+
+        eprintln!("zone_query_channel_paged: got {} messages, cursor_slot={}, lib_slot={}, done={}",
+            items.len(), new_cursor_slot, lib_slot, done);
+
+        let out = serde_json::json!({
+            "messages": items,
+            "cursor": cursor_val,
+            "cursor_slot": new_cursor_slot,
+            "lib_slot": lib_slot,
+            "done": done
+        });
+        Some(serde_json::to_string(&out).ok()?)
+    })?;
+
+    CString::new(result).ok()
+}
+
+/// Free a string returned by zone_publish, zone_query_channel, zone_derive_channel_id,
+/// or zone_query_channel_paged.
 #[no_mangle]
 pub extern "C" fn zone_free_string(s: *mut c_char) {
     if !s.is_null() {

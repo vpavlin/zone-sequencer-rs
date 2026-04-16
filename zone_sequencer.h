@@ -17,7 +17,15 @@ char* zone_query_channel(const char* node_url, const char* channel_id_hex, int l
 // Caller must free with zone_free_string().
 char* zone_derive_channel_id(const char* signing_key_hex);
 
-// Free a string returned by zone_publish, zone_query_channel, or zone_derive_channel_id.
+// Query inscriptions from a zone channel with cursor-based pagination for full history backfill.
+// cursor_json: JSON cursor from previous call, or NULL to start from genesis.
+// Returns JSON object: {"messages":[...],"cursor":{...},"cursor_slot":N,"lib_slot":N,"done":bool}
+// or NULL on error. Caller must free with zone_free_string().
+// "done" is true when cursor_slot >= lib_slot (all finalized history scanned).
+char* zone_query_channel_paged(const char* node_url, const char* channel_id_hex, const char* cursor_json, int limit);
+
+// Free a string returned by zone_publish, zone_query_channel, zone_derive_channel_id,
+// or zone_query_channel_paged.
 void zone_free_string(char* s);
 
 #ifdef __cplusplus
