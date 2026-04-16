@@ -54,9 +54,13 @@ fn load_checkpoint(path: &str, channel_id_hex: &str) -> Option<SequencerCheckpoi
             return None;
         }
     } else {
-        eprintln!("load_checkpoint: no channel sidecar — discarding stale checkpoint");
-        let _ = fs::remove_file(path);
-        return None;
+        // No sidecar: accept the checkpoint anyway and create the sidecar.
+        // Discarding would reset last_msg_id to root, which breaks publishing
+        // on channels that already have messages.
+        eprintln!("load_checkpoint: no channel sidecar — adopting checkpoint for current channel");
+        if let Ok(channel_bytes) = hex::decode(channel_id_hex) {
+            let _ = fs::write(&sidecar, channel_bytes);
+        }
     }
 
     let data = fs::read(path).ok()?;
@@ -466,15 +470,71 @@ fn zone_sequencer_create_inner(
     let channel_id = ChannelId::from(channel_bytes);
     let url: Url = node_url_str.parse().ok()?;
 
-    let checkpoint = load_checkpoint(ckpt_path, channel_id_hex_str);
+    let rt = get_runtime();
+
+    let checkpoint = load_checkpoint(ckpt_path, channel_id_hex_str).or_else(|| {
+        // No checkpoint — bootstrap by scanning the channel for the latest
+        // inscription.  Without this, the sequencer starts with MsgId::root()
+        // as parent, which is only valid for brand-new channels.  On existing
+        // channels the node rejects inscriptions with a duplicate root parent.
+        eprintln!("zone_sequencer_create: bootstrapping last_msg_id from chain...");
+        rt.block_on(async {
+            let indexer = ZoneIndexer::new(channel_id, url.clone(), None);
+            let http_client = lb_common_http_client::CommonHttpClient::new(None);
+
+            let info = http_client.consensus_info(url.clone()).await.ok()?;
+            let tip_slot: u64 = info.slot.into();
+            let lib: lb_core::header::HeaderId = info.lib;
+
+            // Scan the last 100k slots for our channel's messages
+            let lookback: u64 = 100_000;
+            let start_slot = tip_slot.saturating_sub(lookback);
+            let cursor = serde_json::from_str::<logos_blockchain_zone_sdk::indexer::Cursor>(
+                &format!(r#"{{"slot":{},"last_id":null}}"#, start_slot)
+            ).ok();
+
+            let mut last_msg_id = None;
+            let mut cursor_opt = cursor;
+            loop {
+                let poll = indexer.next_messages(cursor_opt, 1000).await.ok()?;
+                if let Some(last) = poll.messages.last() {
+                    last_msg_id = Some(last.id);
+                }
+                if poll.messages.is_empty() {
+                    break;
+                }
+                // Check if cursor advanced past tip
+                let cursor_val = serde_json::to_value(&poll.cursor).ok()?;
+                let cursor_slot = cursor_val["slot"].as_u64().unwrap_or(0);
+                if cursor_slot >= tip_slot {
+                    break;
+                }
+                cursor_opt = Some(poll.cursor);
+            }
+
+            if let Some(msg_id) = last_msg_id {
+                let lib_slot = info.slot;
+                eprintln!("zone_sequencer_create: bootstrapped last_msg_id={}",
+                    hex::encode(<[u8; 32]>::from(msg_id)));
+                Some(SequencerCheckpoint {
+                    last_msg_id: msg_id,
+                    pending_txs: vec![],
+                    lib,
+                    lib_slot,
+                })
+            } else {
+                eprintln!("zone_sequencer_create: no existing inscriptions — starting from root");
+                None
+            }
+        })
+    });
+
     eprintln!("zone_sequencer_create: node={} channel={} checkpoint={}",
         url, channel_id_hex_str,
         if checkpoint.is_some() { "loaded" } else { "fresh" });
 
-    let rt = get_runtime();
-    let sequencer = rt.block_on(async {
-        ZoneSequencer::init(channel_id, signing_key, url, None, checkpoint)
-    });
+    let _guard = rt.enter();
+    let sequencer = ZoneSequencer::init(channel_id, signing_key, url, None, checkpoint);
 
     let handle = Box::new(SequencerHandle {
         sequencer,
@@ -517,31 +577,42 @@ fn zone_sequencer_publish_inner(
     let data_str = unsafe { CStr::from_ptr(data) }.to_str().ok()?;
     let data_bytes = data_str.as_bytes().to_vec();
 
-    eprintln!("zone_sequencer_publish: publishing {} bytes...", data_bytes.len());
+    eprintln!("zone_sequencer_publish: publishing {} bytes to channel {}...",
+        data_bytes.len(), h.channel_id_hex);
 
     let rt = get_runtime();
     let result = rt.block_on(async {
-        let mut attempts = 0;
-        loop {
-            attempts += 1;
-            match h.sequencer.publish(data_bytes.clone()).await {
-                Ok(result) => {
-                    let id_bytes: [u8; 32] = result.inscription_id.into();
-                    let id_hex = hex::encode(id_bytes);
-                    eprintln!("zone_sequencer_publish: inscription_id={}", id_hex);
-                    let mut clean_cp = result.checkpoint.clone();
-                    clean_cp.pending_txs.clear();
-                    save_checkpoint(&h.checkpoint_path, &clean_cp, &h.channel_id_hex);
-                    return Some(id_hex);
-                }
-                Err(e) => {
-                    if attempts > 5 {
-                        eprintln!("zone_sequencer_publish: failed after {} attempts: {}", attempts, e);
-                        return None;
+        // Wrap in a timeout so a stuck actor (e.g. still connecting to the
+        // blocks stream) doesn't block the calling thread forever.
+        match tokio::time::timeout(Duration::from_secs(120), async {
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                match h.sequencer.publish(data_bytes.clone()).await {
+                    Ok(result) => {
+                        let id_bytes: [u8; 32] = result.inscription_id.into();
+                        let id_hex = hex::encode(id_bytes);
+                        eprintln!("zone_sequencer_publish: inscription_id={}", id_hex);
+                        let mut clean_cp = result.checkpoint.clone();
+                        clean_cp.pending_txs.clear();
+                        save_checkpoint(&h.checkpoint_path, &clean_cp, &h.channel_id_hex);
+                        return Some(id_hex);
                     }
-                    eprintln!("zone_sequencer_publish: attempt {}: {} — retrying in 1s...", attempts, e);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Err(e) => {
+                        if attempts > 5 {
+                            eprintln!("zone_sequencer_publish: failed after {} attempts: {}", attempts, e);
+                            return None;
+                        }
+                        eprintln!("zone_sequencer_publish: attempt {}: {} — retrying in 1s...", attempts, e);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
                 }
+            }
+        }).await {
+            Ok(r) => r,
+            Err(_) => {
+                eprintln!("zone_sequencer_publish: timed out after 120s — sequencer actor may be stuck initializing");
+                None
             }
         }
     })?;
